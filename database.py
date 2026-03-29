@@ -394,6 +394,59 @@ def get_all_subscriptions() -> list[dict]:
         _release_conn(conn)
 
 
+# ─── User Profile ─────────────────────────────────────────────────────────────
+
+def save_user_profile(user_id: int, city: str, specialization: str,
+                      education: str, email: str):
+    if not DB_AVAILABLE:
+        if user_id in _mem_users:
+            _mem_users[user_id].update({
+                "city": city, "specialization": specialization,
+                "education": education, "email": email,
+            })
+        return
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            # Add profile columns if they don't exist yet
+            cur.execute("""
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS city TEXT,
+                    ADD COLUMN IF NOT EXISTS specialization TEXT,
+                    ADD COLUMN IF NOT EXISTS education TEXT,
+                    ADD COLUMN IF NOT EXISTS email TEXT
+            """)
+            cur.execute("""
+                UPDATE users
+                SET city = %s, specialization = %s, education = %s, email = %s
+                WHERE user_id = %s
+            """, (city, specialization, education, email, user_id))
+            conn.commit()
+    finally:
+        _release_conn(conn)
+
+
+def get_user_profile(user_id: int) -> dict:
+    if not DB_AVAILABLE:
+        u = _mem_users.get(user_id, {})
+        return {k: u.get(k) for k in ("city", "specialization", "education", "email")}
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute("""
+                    SELECT city, specialization, education, email
+                    FROM users WHERE user_id = %s
+                """, (user_id,))
+                row = cur.fetchone()
+                return dict(row) if row else {}
+            except Exception:
+                conn.rollback()
+                return {}
+    finally:
+        _release_conn(conn)
+
+
 def get_stats() -> dict:
     if not DB_AVAILABLE:
         return {
