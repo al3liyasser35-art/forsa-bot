@@ -255,19 +255,44 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def show_latest_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 1):
     per_page = 3
-    offset = (page - 1) * per_page
-    total = len(DUMMY_JOBS)
-    jobs_page = DUMMY_JOBS[offset:offset + per_page]
+    target = update.callback_query.message
 
-    header = (
-        f"🗂 <b>آخر الوظائف المتاحة</b>\n"
-        f"📊 إجمالي: <b>{total}</b> وظيفة | صفحة {page}/{-(-total // per_page)}\n\n"
+    # أرسل رسالة انتظار
+    await target.edit_text(
+        "⏳ <b>جاري جلب أحدث الوظائف...</b>",
+        parse_mode="HTML",
     )
-    cards = "\n\n".join(_job_card(j) for j in jobs_page)
 
+    # جلب حي من JSearch (وظائف السعودية)
+    live_jobs = job_fetcher.fetch_jsearch(
+        keyword="jobs in Saudi Arabia", location="Saudi Arabia",
+        page=page, num_pages=1,
+    )
+
+    # احتياطي: الوظائف الوهمية إذا فشل الاتصال
+    if not live_jobs:
+        live_jobs = DUMMY_JOBS
+
+    # حفظ في قاعدة البيانات
+    if live_jobs and live_jobs is not DUMMY_JOBS:
+        db.insert_jobs(live_jobs)
+
+    offset = (page - 1) * per_page
+    jobs_page = live_jobs[offset:offset + per_page]
+    total = len(live_jobs)
+    pages = -(-total // per_page)
+
+    source_label = "🌐 JSearch" if live_jobs is not DUMMY_JOBS else "📦 بيانات تجريبية"
+    header = (
+        f"🗂 <b>آخر الوظائف المتاحة</b>  {source_label}\n"
+        f"📊 إجمالي: <b>{total}</b> وظيفة | صفحة {page}/{pages}\n\n"
+    )
+    cards = "\n\n".join(
+        job_fetcher.format_jsearch_card(j) if j.get("source") == "jsearch" else _job_card(j)
+        for j in jobs_page
+    )
     keyboard = _pagination_keyboard(page, total, per_page, "latest_page")
 
-    target = update.callback_query.message
     try:
         await target.edit_text(
             header + cards,
@@ -466,15 +491,36 @@ async def _do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int):
     keyword  = ctx.user_data.get("search_keyword", "")
     location = ctx.user_data.get("search_location", "")
 
-    # ابحث في الوظائف الوهمية أولاً ثم قاعدة البيانات
-    dummy_results = [
-        j for j in DUMMY_JOBS
-        if (not keyword or keyword in j["title"] or keyword in j.get("category", ""))
-        and (not location or location in j.get("location", ""))
-    ]
-    db_results, db_total = db.search_jobs(keyword=keyword, location=location, page=page)
-    all_results = dummy_results + db_results
-    total = len(dummy_results) + db_total
+    # رسالة انتظار
+    wait_msg = await update.message.reply_text(
+        f"🔍 <b>جاري البحث عن «{html.escape(keyword)}»...</b>",
+        parse_mode="HTML",
+    )
+
+    # بحث حي من JSearch
+    live_results = job_fetcher.search_live(keyword=keyword, location=location, page=page)
+
+    # إذا أعطت نتائج → حفظها واستخدامها
+    if live_results:
+        db.insert_jobs(live_results)
+        all_results = live_results
+        total = len(live_results)
+        source = "🌐 JSearch"
+    else:
+        # احتياطي: قاعدة البيانات المحلية
+        db_results, db_total = db.search_jobs(keyword=keyword, location=location, page=page)
+        # ثم الوظائف الوهمية
+        dummy_results = [
+            j for j in DUMMY_JOBS
+            if (not keyword or keyword.lower() in j["title"].lower()
+                or keyword.lower() in j.get("category", "").lower())
+            and (not location or location in j.get("location", ""))
+        ]
+        all_results = db_results + dummy_results
+        total = db_total + len(dummy_results)
+        source = "📦 بيانات محلية"
+
+    await wait_msg.delete()
 
     if not all_results:
         await update.message.reply_text(
@@ -487,9 +533,12 @@ async def _do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int):
 
     loc_text = f" في <b>{html.escape(location)}</b>" if location else ""
     header = (
-        f"✅ وجدت <b>{total}</b> وظيفة لـ «{html.escape(keyword)}»{loc_text}\n\n"
+        f"✅ <b>{total}</b> وظيفة لـ «{html.escape(keyword)}»{loc_text}  {source}\n\n"
     )
-    cards = "\n\n".join(_job_card(j) for j in all_results[:config.JOBS_PER_PAGE])
+    cards = "\n\n".join(
+        job_fetcher.format_jsearch_card(j) if j.get("source") == "jsearch" else _job_card(j)
+        for j in all_results[:config.JOBS_PER_PAGE]
+    )
     keyboard = _pagination_keyboard(page, total, config.JOBS_PER_PAGE,
                                     f"search:{keyword}:{location}")
     await update.message.reply_text(
@@ -663,23 +712,35 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("search:"):
         parts = data.split(":", 3)
         keyword, location, page_str = parts[1], parts[2], parts[3]
-        ctx.user_data["search_keyword"] = keyword
-        ctx.user_data["search_location"] = location
-        dummy_results = [
-            j for j in DUMMY_JOBS
-            if (not keyword or keyword in j["title"] or keyword in j.get("category", ""))
-            and (not location or location in j.get("location", ""))
-        ]
-        db_results, db_total = db.search_jobs(keyword=keyword, location=location,
-                                               page=int(page_str))
-        all_results = dummy_results + db_results
-        total = len(dummy_results) + db_total
+        page = int(page_str)
+
+        await query.edit_message_text(
+            f"🔍 <b>جاري جلب صفحة {page}...</b>", parse_mode="HTML"
+        )
+
+        live_results = job_fetcher.search_live(keyword=keyword, location=location, page=page)
+        if live_results:
+            db.insert_jobs(live_results)
+            all_results, total, source = live_results, len(live_results), "🌐 JSearch"
+        else:
+            db_results, db_total = db.search_jobs(keyword=keyword, location=location, page=page)
+            all_results, total, source = db_results, db_total, "📦 محلي"
+
         if not all_results:
-            await query.edit_message_text("لا مزيد من النتائج.")
+            await query.edit_message_text(
+                "لا مزيد من النتائج.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:home")
+                ]]),
+            )
             return
-        header = f"✅ <b>{total}</b> وظيفة — صفحة {page_str}:\n\n"
-        cards = "\n\n".join(_job_card(j) for j in all_results[:config.JOBS_PER_PAGE])
-        keyboard = _pagination_keyboard(int(page_str), total, config.JOBS_PER_PAGE,
+
+        header = f"✅ <b>{total}</b> وظيفة — صفحة {page}  {source}\n\n"
+        cards = "\n\n".join(
+            job_fetcher.format_jsearch_card(j) if j.get("source") == "jsearch" else _job_card(j)
+            for j in all_results[:config.JOBS_PER_PAGE]
+        )
+        keyboard = _pagination_keyboard(page, total, config.JOBS_PER_PAGE,
                                         f"search:{keyword}:{location}")
         await query.edit_message_text(
             header + cards, parse_mode="HTML",

@@ -25,6 +25,9 @@ ADZUNA_COUNTRY = os.getenv("ADZUNA_COUNTRY", "ae")  # ae = UAE, sa = Saudi Arabi
 
 REED_API_KEY = os.getenv("REED_API_KEY", "")
 
+# RapidAPI / JSearch
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+
 # Bot Settings
 JOBS_PER_PAGE = 5
 MAX_SUBSCRIPTIONS_PER_USER = 10
